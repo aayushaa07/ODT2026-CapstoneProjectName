@@ -1,0 +1,842 @@
+from machine import Pin, SoftI2C, ADC
+
+import bluetooth
+import sh1106
+import time
+from utime import ticks_diff, ticks_ms
+from max30102 import MAX30102, MAX30105_PULSE_AMP_MEDIUM
+
+
+
+#  HEART RATE MONITOR
+
+class HeartRateMonitor:
+
+    def __init__(self, window_size=60, smoothing_window=5):
+        self.window_size      = window_size
+        self.smoothing_window = smoothing_window
+        self.samples          = []
+        self.timestamps       = []
+        self.filtered_samples = []
+        self.peak_times       = []
+
+    def add_sample(self, sample):
+        ts = ticks_ms()
+        self.samples.append(sample)
+        self.timestamps.append(ts)
+
+        if len(self.samples) >= self.smoothing_window:
+            smoothed = sum(self.samples[-self.smoothing_window:]) / self.smoothing_window
+            self.filtered_samples.append(smoothed)
+        else:
+            self.filtered_samples.append(float(sample))
+
+        if len(self.samples) > self.window_size:
+            self.samples.pop(0)
+            self.timestamps.pop(0)
+            self.filtered_samples.pop(0)
+
+    def find_peaks(self):
+        peaks = []
+        if len(self.filtered_samples) < 3:
+            return peaks
+
+        min_val = min(self.filtered_samples)
+        max_val = max(self.filtered_samples)
+        span    = max_val - min_val
+
+        if span < 100:
+            return peaks
+
+        threshold = min_val + span * 0.55
+
+        for i in range(1, len(self.filtered_samples) - 1):
+            prev = self.filtered_samples[i - 1]
+            curr = self.filtered_samples[i]
+            nxt  = self.filtered_samples[i + 1]
+            if curr > threshold and curr > prev and curr >= nxt:
+                peaks.append((self.timestamps[i], curr))
+
+        return peaks
+
+    def calculate_heart_rate(self):
+        peaks = self.find_peaks()
+        if len(peaks) < 2:
+            return None
+
+        intervals = []
+        for i in range(1, len(peaks)):
+            gap = ticks_diff(peaks[i][0], peaks[i-1][0])
+            if 300 < gap < 1500:
+                intervals.append(gap)
+                if len(self.peak_times) > 20:
+                    self.peak_times.pop(0)
+                self.peak_times.append(peaks[i][0])
+
+        if not intervals:
+            return None
+
+        avg = sum(intervals) / len(intervals)
+        hr  = 60000 / avg
+        return int(hr) if 40 <= hr <= 180 else None
+
+    def calculate_pulse_amplitude(self):
+        if len(self.filtered_samples) < 10:
+            return None
+        recent = self.filtered_samples[-20:]
+        return int(max(recent) - min(recent))
+
+    def calculate_signal_strength(self):
+        if len(self.filtered_samples) < 5:
+            return 0
+        avg = sum(self.filtered_samples[-5:]) / 5
+        strength = min(100, int((avg / 30000) * 100))
+        return max(0, strength)
+
+    def calculate_hrv(self):
+        if len(self.peak_times) < 4:
+            return None
+        intervals = []
+        for i in range(1, len(self.peak_times)):
+            gap = ticks_diff(self.peak_times[i], self.peak_times[i-1])
+            if 300 < gap < 1500:
+                intervals.append(gap)
+        if len(intervals) < 3:
+            return None
+        avg      = sum(intervals) / len(intervals)
+        variance = sum((x - avg) ** 2 for x in intervals) / len(intervals)
+        return int(variance ** 0.5)
+
+
+#  BLUETOOTH
+
+
+name               = "LieDet"
+ble                = bluetooth.BLE()
+conn_handle_global = None
+value              = ""
+
+ble.active(False)
+time.sleep(0.5)
+ble.active(True)
+ble.config(gap_name=name)
+
+service_UUID = bluetooth.UUID("6e400001-b5a3-f393-e0a9-e50e24dcca9e")
+tx_UUID      = bluetooth.UUID("6e400003-b5a3-f393-e0a9-e50e24dcca9e")
+rx_UUID      = bluetooth.UUID("6e400002-b5a3-f393-e0a9-e50e24dcca9e")
+
+tx_char  = (tx_UUID, bluetooth.FLAG_NOTIFY)
+rx_char  = (rx_UUID, bluetooth.FLAG_WRITE)
+service  = (service_UUID, (tx_char, rx_char),)
+((tx_handle, rx_handle),) = ble.gatts_register_services((service,))
+
+
+def event_occured(event, data):
+    global value, conn_handle_global
+    if event == 1:
+        conn_handle, _, _  = data
+        conn_handle_global = conn_handle
+        print("Phone connected!")
+    elif event == 2:
+        conn_handle, _, _  = data
+        conn_handle_global = None
+        print("Disconnected.")
+        advertise(name)
+    elif event == 3:
+        conn_handle, value_handle = data
+        if value_handle == rx_handle:
+            raw   = ble.gatts_read(rx_handle).rstrip(b'\x00')
+            value = raw.decode().strip()
+            print("Received:", value)
+
+
+def advertise(device_name):
+    nb  = device_name.encode()
+    adv = bytearray([0x02, 0x01, 0x06, len(nb) + 1, 0x08]) + nb
+    ble.gap_advertise(100000, adv_data=adv)
+    print("Advertising as:", device_name)
+
+
+def send_ble(msg):
+    if conn_handle_global is not None:
+        try:
+            ble.gatts_notify(conn_handle_global, tx_handle, msg.encode())
+        except:
+            pass
+
+
+ble.irq(event_occured)
+advertise(name)
+
+
+#  SHARED I2C BUS
+shared_i2c = SoftI2C(sda=Pin(21), scl=Pin(22), freq=100000)
+
+print("Scanning I2C bus...")
+devices = shared_i2c.scan()
+print("Found I2C devices:", [hex(d) for d in devices])
+
+
+#  SENSOR SETUP
+
+print("Initialising MAX30102...")
+sensor = MAX30102(i2c=shared_i2c)
+
+if sensor.i2c_address not in devices:
+    print("ERROR: MAX30102 not found on I2C bus!")
+    while True:
+        time.sleep(1)
+
+print("MAX30102 found!")
+sensor.setup_sensor()
+sensor.set_sample_rate(100)
+sensor.set_fifo_average(4)
+sensor.set_active_leds_amplitude(0xFF)
+
+time.sleep(3)
+
+hr_monitor = HeartRateMonitor(window_size=60, smoothing_window=5)
+
+# GSR
+gsr = ADC(Pin(34))
+gsr.atten(ADC.ATTN_11DB)
+gsr.width(ADC.WIDTH_12BIT)
+
+
+
+#  OLED SETUP
+
+
+WIDTH  = 128
+HEIGHT = 64
+oled   = None
+
+try:
+    oled = sh1106.SH1106_I2C(WIDTH, HEIGHT, shared_i2c, addr=0x3C, rotate=180)
+    try:
+        oled.sleep(False)
+    except:
+        pass
+    oled.fill(0)
+    oled.text("LIE DETECTOR", 10, 20, 1)
+    oled.text("  Starting...", 10, 36, 1)
+    oled.show()
+    time.sleep(2)
+    print("OLED ready!")
+except Exception as e:
+    print("OLED ERROR:", e)
+    oled = None
+
+
+
+#  VARIABLES
+
+
+hr_compute_interval = 2
+ref_time            = ticks_ms()
+
+bpm        = 0
+gsr_val    = 0
+pulse_amp  = 0
+hrv        = 0
+signal_pct = 0
+red_val    = 0
+ir_val     = 0
+spo2_est   = 0
+
+baseline_bpm = 0
+baseline_gsr = 0
+baseline_amp = 0
+baseline_hrv = 0
+
+calibrated        = False
+calibration_start = ticks_ms()
+CALIBRATION_TIME  = 10000
+
+bpm_readings = []
+gsr_readings = []
+amp_readings = []
+hrv_readings = []
+
+score   = 0
+state   = "CALM"
+verdict = "---"
+
+question_state     = "IDLE"
+question_ask_time  = 0
+QUESTION_DELAY     = 2000
+LISTEN_WINDOW      = 10000          # extended: stress peaks 3-8s after the lie
+
+pre_question_bpm   = 0
+pre_question_gsr   = 0
+pre_question_amp   = 0
+
+peak_bpm_in_window = 0
+peak_gsr_in_window = 0
+min_amp_in_window  = 999999
+
+last_question_time = 0
+QUESTION_COOLDOWN  = 10000
+
+question_number    = 1
+
+
+ROLLING_WINDOW   = 15000           
+rolling_bpm      = []
+rolling_gsr      = []
+
+
+listen_bpm_early = []
+listen_gsr_early = []
+listen_bpm_late  = []
+listen_gsr_late  = []
+
+blink_state    = False
+blink_ref_time = ticks_ms()
+
+#  HELPER FUNCTIONS
+
+
+def pct_change(current, base):
+    if base == 0 or base is None:
+        return 0
+    return ((current - base) / base) * 100
+
+
+def calculate_score(bpm_pct, gsr_pct, amp_pct, hrv_pct, roc_bpm=0, roc_gsr=0):
+    """
+    Scoring v3 — GSR dominant, rate-of-change aware.
+
+    Weights:
+      GSR rise         55%  (most reliable, involuntary sweat response)
+      BPM rise         30%  (useful but can spike from movement/coughing)
+      Rate of change   15%  (sudden spike scores extra vs slow drift)
+
+    Thresholds lowered to 8% so light stress registers.
+    Verdict bands tightened so UNCERTAIN covers the middle range clearly.
+    """
+    s = 0
+
+    
+    if gsr_pct > 8:   s += 15
+    if gsr_pct > 18:  s += 15
+    if gsr_pct > 32:  s += 15
+    if gsr_pct > 50:  s += 10
+
+    # BPM (30 pts max)
+    if bpm_pct > 8:   s += 10
+    if bpm_pct > 16:  s += 10
+    if bpm_pct > 26:  s += 10
+
+    # Amplitude drop (vasoconstriction — up to 10 pts)
+    if amp_pct < -8:  s += 5
+    if amp_pct < -20: s += 5
+
+    
+    if roc_gsr > 5:   s += 5
+    if roc_gsr > 12:  s += 5
+    if roc_bpm > 5:   s += 5
+
+    return min(100, s)
+
+
+def score_to_state(s):
+    if s >= 75:   return "VERY HIGH"
+    elif s >= 55: return "HIGH STRESS"
+    elif s >= 30: return "ELEVATED"
+    else:         return "CALM"
+
+
+def score_to_verdict(s):
+    if s >= 75:   return "LIE"
+    elif s >= 55: return "LIKELY LIE"
+    elif s >= 30: return "UNCERTAIN"
+    else:         return "TRUTH"
+
+
+def estimate_spo2(red_value, ir_value):
+    if red_value <= 0 or ir_value <= 0:
+        return 0
+    ratio = red_value / ir_value
+    est   = int(110 - (25 * ratio))
+    if est < 80:  est = 80
+    if est > 100: est = 100
+    return est
+
+
+# ── Basic 4-line text screen ────────────────────────────────────
+def update_oled_text(line1="", line2="", line3="", line4=""):
+    global oled
+    if oled is None:
+        return
+    try:
+        oled.fill(0)
+        oled.text(str(line1)[:21], 0,  0, 1)
+        oled.text(str(line2)[:21], 0, 16, 1)
+        oled.text(str(line3)[:21], 0, 32, 1)
+        oled.text(str(line4)[:21], 0, 48, 1)
+        oled.show()
+    except Exception as e:
+        print("OLED TEXT ERROR:", e)
+
+
+# ── Live graph screen — sensitive, spikes on tiny changes ────────
+
+
+BPM_HISTORY = [0] * 110      # one point per pixel column (110 usable px)
+GSR_HISTORY = [0] * 110
+
+BPM_GRAPH_TOP    = 12        # y-pixel where BPM graph starts
+BPM_GRAPH_HEIGHT = 23        # pixels tall for BPM
+GSR_GRAPH_TOP    = 38        # y-pixel where GSR graph starts
+GSR_GRAPH_HEIGHT = 13        # pixels tall for GSR
+
+BPM_WINDOW = 6               # ±bpm around rolling avg shown in full height
+GSR_WINDOW = 80              # ±raw units around rolling avg shown in full height
+
+GRAPH_X_START = 18           
+
+def _clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def _bpm_to_y(val, centre):
+    """Map bpm value to a y-pixel. Smaller y = higher on screen."""
+    half   = BPM_GRAPH_HEIGHT // 2
+    centre = centre if centre > 0 else 75
+    offset = _clamp(val - centre, -BPM_WINDOW, BPM_WINDOW)
+    # offset +BPM_WINDOW → top of graph (low y), -BPM_WINDOW → bottom (high y)
+    frac   = (BPM_WINDOW - offset) / (2 * BPM_WINDOW)   # 0=top 1=bottom
+    return BPM_GRAPH_TOP + int(frac * (BPM_GRAPH_HEIGHT - 1))
+
+
+def _gsr_to_y(val, centre):
+    """Map gsr value to a y-pixel."""
+    centre = centre if centre > 0 else 2000
+    offset = _clamp(val - centre, -GSR_WINDOW, GSR_WINDOW)
+    frac   = (GSR_WINDOW - offset) / (2 * GSR_WINDOW)
+    return GSR_GRAPH_TOP + int(frac * (GSR_GRAPH_HEIGHT - 1))
+
+
+def update_oled_live():
+    """
+    Scrolling dual waveform.
+    Tiny sensor changes produce visible spikes because the y-axis
+    only spans a narrow window around the rolling centre value.
+    No state label, no score — just BPM and GSR.
+    """
+    global oled, BPM_HISTORY, GSR_HISTORY
+
+    if oled is None:
+        return
+
+    try:
+        # Shift histories left, append new point
+        BPM_HISTORY.pop(0)
+        GSR_HISTORY.pop(0)
+
+        # Centre each graph on the rolling average of recent history
+        # (ignoring zeros from startup)
+        valid_bpm = [v for v in BPM_HISTORY if v > 0]
+        valid_gsr = [v for v in GSR_HISTORY if v > 0]
+        bpm_centre = (sum(valid_bpm) / len(valid_bpm)) if valid_bpm else (bpm if bpm > 0 else 75)
+        gsr_centre = (sum(valid_gsr) / len(valid_gsr)) if valid_gsr else (gsr_val if gsr_val > 0 else 2000)
+
+        BPM_HISTORY.append(_bpm_to_y(bpm,     bpm_centre))
+        GSR_HISTORY.append(_gsr_to_y(gsr_val, gsr_centre))
+
+        oled.fill(0)
+
+        oled.text("B:{}".format(bpm),     0, 0,  1)
+        oled.text("G:{}".format(gsr_val), 0, 55, 1)
+
+       
+        for x in range(0, 128):
+            oled.pixel(x, 36, 1)
+
+       
+        n = len(BPM_HISTORY)
+        for i in range(1, n):
+            x0 = GRAPH_X_START + i - 1
+            x1 = GRAPH_X_START + i
+            y0 = BPM_HISTORY[i - 1]
+            y1 = BPM_HISTORY[i]
+            if x1 < 128 and y0 > 0 and y1 > 0:
+                oled.line(x0, y0, x1, y1, 1)
+
+       
+        for i in range(1, n):
+            x0 = GRAPH_X_START + i - 1
+            x1 = GRAPH_X_START + i
+            y0 = GSR_HISTORY[i - 1]
+            y1 = GSR_HISTORY[i]
+            if x1 < 128 and y0 > 0 and y1 > 0:
+                oled.line(x0, y0, x1, y1, 1)
+
+        oled.show()
+
+    except Exception as e:
+        print("OLED LIVE ERROR:", e)
+
+
+
+def update_oled_ask_now(seconds_left):
+    global oled, blink_state, blink_ref_time
+    if oled is None:
+        return
+    try:
+        if ticks_diff(ticks_ms(), blink_ref_time) > 400:
+            blink_state    = not blink_state
+            blink_ref_time = ticks_ms()
+
+        oled.fill(0)
+        oled.text("Q{} ACTIVE".format(question_number), 0, 0, 1)
+
+        if blink_state:
+            oled.text(">  ASK NOW! <", 0, 20, 1)
+
+        oled.text("{}s remaining".format(seconds_left), 10, 38, 1)
+        oled.text("BPM:{}".format(bpm), 0, 52, 1)
+        oled.show()
+    except Exception as e:
+        print("OLED ASK ERROR:", e)
+
+
+def update_oled_result(verdict_str, score_val, state_str):
+    global oled
+    if oled is None:
+        return
+    try:
+        oled.fill(0)
+        oled.text("Q{} RESULT".format(question_number), 0, 0, 1)
+
+        for x in range(0, 128):
+            oled.pixel(x, 10, 1)
+
+        oled.text("VERDICT:", 0, 14, 1)
+        oled.text(">> {} <<".format(verdict_str[:12]), 0, 26, 1)
+        oled.text("Score: {}/100".format(score_val), 0, 40, 1)
+        oled.text(state_str[:21], 0, 52, 1)
+        oled.show()
+    except Exception as e:
+        print("OLED RESULT ERROR:", e)
+
+def trigger_question():
+    global question_state, question_ask_time
+    global pre_question_bpm, pre_question_gsr, pre_question_amp
+    global peak_bpm_in_window, peak_gsr_in_window, min_amp_in_window
+    global question_number
+    global listen_bpm_early, listen_gsr_early, listen_bpm_late, listen_gsr_late
+
+    
+    now_ms = ticks_ms()
+    recent_bpm = [v for (t, v) in rolling_bpm if ticks_diff(now_ms, t) < ROLLING_WINDOW and v > 0]
+    recent_gsr = [v for (t, v) in rolling_gsr if ticks_diff(now_ms, t) < ROLLING_WINDOW and v > 0]
+
+    pre_question_bpm = int(sum(recent_bpm) / len(recent_bpm)) if recent_bpm else bpm
+    pre_question_gsr = int(sum(recent_gsr) / len(recent_gsr)) if recent_gsr else gsr_val
+    pre_question_amp = pulse_amp
+
+    peak_bpm_in_window = pre_question_bpm
+    peak_gsr_in_window = pre_question_gsr
+    min_amp_in_window  = pulse_amp if pulse_amp > 0 else 999999
+
+    # Reset early/late split buffers
+    listen_bpm_early = []
+    listen_gsr_early = []
+    listen_bpm_late  = []
+    listen_gsr_late  = []
+
+    question_state    = "QUESTION_ASKED"
+    question_ask_time = ticks_ms()
+
+    print()
+    print("*" * 45)
+    print("  QUESTION {} — GET READY".format(question_number))
+    print("  Rolling baseline BPM: {} (from {} samples)".format(pre_question_bpm, len(recent_bpm)))
+    print("  Rolling baseline GSR: {} (from {} samples)".format(pre_question_gsr, len(recent_gsr)))
+    print("  ASK YOUR QUESTION IN 2 SECONDS!")
+    print("*" * 45)
+
+    update_oled_text(
+        "Q{} GET READY".format(question_number),
+        "",
+        "Ask in 2 sec...",
+        "BPM:{}".format(bpm)
+    )
+
+    send_ble("TYPE:QUESTION|Q:{}|MSG:Question asked|BPM:{}|GSR:{}|AMP:{}|HRV:{}|SPO2:{}|IR:{}|RED:{}".format(
+        question_number, pre_question_bpm, pre_question_gsr,
+        pre_question_amp, hrv, spo2_est, ir_val, red_val
+    ))
+
+
+def analyse_response():
+    global question_state, score, state, verdict, last_question_time, question_number
+
+    bpm_rise = peak_bpm_in_window - pre_question_bpm
+    gsr_rise = peak_gsr_in_window - pre_question_gsr
+    amp_drop = pre_question_amp - min_amp_in_window if min_amp_in_window != 999999 else 0
+
+    bpm_pct = pct_change(peak_bpm_in_window, pre_question_bpm)
+    gsr_pct = pct_change(peak_gsr_in_window, pre_question_gsr)
+    amp_pct = -pct_change(
+        min_amp_in_window if min_amp_in_window != 999999 else pre_question_amp,
+        pre_question_amp
+    )
+    hrv_pct = pct_change(hrv, baseline_hrv)
+
+    # Rate-of-change: compare average of early half vs late half of listen window
+    # A sudden spike in the second half = more deceptive than a gradual rise
+    early_bpm_avg = (sum(listen_bpm_early) / len(listen_bpm_early)) if listen_bpm_early else pre_question_bpm
+    late_bpm_avg  = (sum(listen_bpm_late)  / len(listen_bpm_late))  if listen_bpm_late  else pre_question_bpm
+    early_gsr_avg = (sum(listen_gsr_early) / len(listen_gsr_early)) if listen_gsr_early else pre_question_gsr
+    late_gsr_avg  = (sum(listen_gsr_late)  / len(listen_gsr_late))  if listen_gsr_late  else pre_question_gsr
+
+    roc_bpm = pct_change(late_bpm_avg, early_bpm_avg)   # % rise from early→late
+    roc_gsr = pct_change(late_gsr_avg, early_gsr_avg)
+
+    score   = calculate_score(bpm_pct, gsr_pct, amp_pct, hrv_pct, roc_bpm, roc_gsr)
+    state   = score_to_state(score)
+    verdict = score_to_verdict(score)
+
+    last_question_time = ticks_ms()
+    question_state     = "RESULT"
+
+    print()
+    print("★" * 45)
+    print("  ANALYSIS COMPLETE — Q{}".format(question_number))
+    print("  BPM rise:  {:+} ({:+.1f}%)  RoC: {:+.1f}%".format(bpm_rise, bpm_pct, roc_bpm))
+    print("  GSR rise:  {:+} ({:+.1f}%)  RoC: {:+.1f}%".format(gsr_rise, gsr_pct, roc_gsr))
+    print("  AMP drop:  {:+} ({:+.1f}%)".format(amp_drop, amp_pct))
+    print("  SCORE:     {}/100".format(score))
+    print("  STATE:     {}".format(state))
+    print("  VERDICT:   {}".format(verdict))
+    print("★" * 45)
+    print()
+
+    update_oled_result(verdict, score, state)
+
+    send_ble("TYPE:RESULT|Q:{}|SCORE:{}|STATE:{}|VERDICT:{}|BPM:{}|GSR:{}|AMP:{}|HRV:{}|SPO2:{}|SIG:{}|IR:{}|RED:{}".format(
+        question_number, score, state, verdict, peak_bpm_in_window, peak_gsr_in_window,
+        pulse_amp, hrv, spo2_est, signal_pct, ir_val, red_val
+    ))
+
+    time.sleep(5)
+    question_state = "IDLE"
+    question_number += 1
+
+
+print("=" * 45)
+print("  LIE DETECTOR BRACELET  v3")
+print("  Place finger FIRMLY on MAX30102")
+print("  Calibrating for 10 seconds...")
+print("=" * 45)
+
+update_oled_text("LIE DETECTOR", "Keep finger on", "sensor firmly", "Cal: 10s...")
+time.sleep(2)
+calibration_start = ticks_ms()
+
+
+#  MAIN LOOP
+
+while True:
+
+    now = ticks_ms()
+
+  
+    try:
+        sensor.check()
+        while sensor.available():
+            red_val = sensor.pop_red_from_storage()
+            ir_val  = sensor.pop_ir_from_storage()
+            if ir_val > 1000:
+                hr_monitor.add_sample(ir_val)
+    except OSError as e:
+        print("Sensor read error:", e, "— retrying...")
+        time.sleep(0.5)
+        continue
+
+    if ticks_diff(now, ref_time) / 1000 >= hr_compute_interval:
+
+        heart_rate = hr_monitor.calculate_heart_rate()
+        amp        = hr_monitor.calculate_pulse_amplitude()
+        hrv_val    = hr_monitor.calculate_hrv()
+        signal_pct = hr_monitor.calculate_signal_strength()
+        gsr_val    = gsr.read()
+        spo2_est   = estimate_spo2(red_val, ir_val)
+
+        if heart_rate and heart_rate > 0: bpm       = heart_rate
+        if amp and amp > 0:               pulse_amp = amp
+        if hrv_val and hrv_val > 0:       hrv       = hrv_val
+
+        # Always maintain a rolling 15s baseline buffer
+        now_ms = ticks_ms()
+        rolling_bpm.append((now_ms, bpm))
+        rolling_gsr.append((now_ms, gsr_val))
+        # Prune entries older than ROLLING_WINDOW
+        while rolling_bpm and ticks_diff(now_ms, rolling_bpm[0][0]) > ROLLING_WINDOW:
+            rolling_bpm.pop(0)
+        while rolling_gsr and ticks_diff(now_ms, rolling_gsr[0][0]) > ROLLING_WINDOW:
+            rolling_gsr.pop(0)
+
+        if question_state == "LISTENING":
+            elapsed_in_window = ticks_diff(now_ms, question_ask_time) - QUESTION_DELAY
+            half_window = LISTEN_WINDOW // 2
+
+            if bpm > peak_bpm_in_window:
+                peak_bpm_in_window = bpm
+            if gsr_val > peak_gsr_in_window:
+                peak_gsr_in_window = gsr_val
+            if pulse_amp < min_amp_in_window and pulse_amp > 0:
+                min_amp_in_window = pulse_amp
+
+            # Split into early and late halves for rate-of-change
+            if elapsed_in_window < half_window:
+                listen_bpm_early.append(bpm)
+                listen_gsr_early.append(gsr_val)
+            else:
+                listen_bpm_late.append(bpm)
+                listen_gsr_late.append(gsr_val)
+
+        # ── CALIBRATION ─────────────────────────────────────────
+        if not calibrated:
+            elapsed   = ticks_diff(now, calibration_start)
+            secs_left = max(0, int((CALIBRATION_TIME - elapsed) / 1000))
+
+            if bpm > 0:       bpm_readings.append(bpm)
+            if gsr_val > 0:   gsr_readings.append(gsr_val)
+            if pulse_amp > 0: amp_readings.append(pulse_amp)
+            if hrv and hrv > 0: hrv_readings.append(hrv)
+
+            if signal_pct < 30:
+                print("Calibrating: {}s | BPM:{} GSR:{} SIG:{}% — press harder".format(
+                    secs_left, bpm, gsr_val, signal_pct))
+                update_oled_text(
+                    "Calibrating {}s".format(secs_left),
+                    "BPM:{} SIG:{}%".format(bpm, signal_pct),
+                    "Press HARDER!",
+                    "GSR:{}".format(gsr_val)
+                )
+            else:
+                print("Calibrating: {}s | BPM:{} GSR:{} SIG:{}% OK".format(
+                    secs_left, bpm, gsr_val, signal_pct))
+                update_oled_text(
+                    "Calibrating {}s".format(secs_left),
+                    "BPM:{} SIG:{}%".format(bpm, signal_pct),
+                    "Hold still...",
+                    "GSR:{}".format(gsr_val)
+                )
+
+            send_ble("TYPE:CAL|BPM:{}|GSR:{}|AMP:{}|HRV:{}|SIG:{}|TIME:{}|SPO2:{}|IR:{}|RED:{}".format(
+                bpm, gsr_val, pulse_amp, hrv, signal_pct, secs_left, spo2_est, ir_val, red_val
+            ))
+
+            if elapsed > CALIBRATION_TIME and len(bpm_readings) >= 3:
+                baseline_bpm = sum(bpm_readings) / len(bpm_readings)
+                baseline_gsr = sum(gsr_readings) / len(gsr_readings) if gsr_readings else 2000
+                baseline_amp = sum(amp_readings) / len(amp_readings) if amp_readings else 1000
+                baseline_hrv = sum(hrv_readings) / len(hrv_readings) if hrv_readings else 50
+
+                if baseline_bpm == 0: baseline_bpm = 75
+                if baseline_amp == 0: baseline_amp = 1000
+                if baseline_gsr == 0: baseline_gsr = 2000
+                if baseline_hrv == 0: baseline_hrv = 50
+
+                calibrated = True
+
+                print("=" * 45)
+                print("  CALIBRATION DONE!")
+                print("  Baseline BPM:", round(baseline_bpm, 1))
+                print("  Baseline GSR:", round(baseline_gsr, 1))
+                print("  Baseline AMP:", round(baseline_amp, 1))
+                print()
+                print("  HOW TO USE:")
+                print("  Send 'Q' via BLE app to trigger question")
+                print("  OLED shows ASK NOW! — ask your question")
+                print("  Verdict appears on screen automatically")
+                print("=" * 45)
+
+                update_oled_text("READY!", "Send Q to start", "BPM:{}".format(int(baseline_bpm)), "")
+                send_ble("TYPE:READY|BBPM:{}|BGSR:{}|BAMP:{}|BHRV:{}".format(
+                    int(baseline_bpm), int(baseline_gsr),
+                    int(baseline_amp), int(baseline_hrv)
+                ))
+
+            elif elapsed > CALIBRATION_TIME and len(bpm_readings) < 3:
+                print("Need more BPM readings ({}/3). Press finger firmly!".format(len(bpm_readings)))
+                update_oled_text("Cal extended", "Need BPM data", "Press harder!", "")
+
+        # ── POST-CALIBRATION ─────────────────────────────────────
+        else:
+            bpm_pct = pct_change(bpm,       baseline_bpm)
+            gsr_pct = pct_change(gsr_val,   baseline_gsr)
+            amp_pct = pct_change(pulse_amp, baseline_amp)
+            hrv_pct = pct_change(hrv,       baseline_hrv)
+
+            score = calculate_score(bpm_pct, gsr_pct, amp_pct, hrv_pct)
+            state = score_to_state(score)
+
+            print("BPM:{} GSR:{} AMP:{} HRV:{} SIG:{}% SCORE:{} STATE:{} SPO2:{} IR:{} RED:{}".format(
+                bpm, gsr_val, pulse_amp, hrv, signal_pct,
+                score, state, spo2_est, ir_val, red_val
+            ))
+
+            
+            if question_state == "IDLE":
+                update_oled_live()      # ← replaces the old graph (no state/score/CALM)
+
+            send_ble("TYPE:LIVE|BPM:{}|GSR:{}|AMP:{}|HRV:{}|SCORE:{}|STATE:{}|SIG:{}|SPO2:{}|IR:{}|RED:{}\n".format(
+                bpm, gsr_val, pulse_amp, hrv, score, state,
+                signal_pct, spo2_est, ir_val, red_val
+            ))
+
+        ref_time = ticks_ms()
+
+    
+    if calibrated:
+        elapsed_since_q = ticks_diff(now, question_ask_time)
+
+        if question_state == "IDLE":
+            if value == "Q":
+                value = ""
+                time_since_last = ticks_diff(now, last_question_time)
+                if time_since_last > QUESTION_COOLDOWN:
+                    trigger_question()
+                else:
+                    wait = int((QUESTION_COOLDOWN - time_since_last) / 1000)
+                    print("Wait {}s before next question".format(wait))
+                    update_oled_text("COOLDOWN", "Wait {}s".format(wait), "", "")
+                    send_ble("TYPE:WAIT|TIME:{}".format(wait))
+
+        elif question_state == "QUESTION_ASKED":
+            if elapsed_since_q >= QUESTION_DELAY:
+                question_state = "LISTENING"
+                print()
+                print(">>> ASK YOUR QUESTION NOW! <<<")
+                print(">>> {} seconds to answer...".format(LISTEN_WINDOW // 1000))
+                send_ble("TYPE:INFO|Q:{}|MSG:ASK NOW - {} seconds".format(
+                    question_number, LISTEN_WINDOW // 1000
+                ))
+
+        elif question_state == "LISTENING":
+            time_remaining = int((LISTEN_WINDOW - elapsed_since_q + QUESTION_DELAY) / 1000)
+
+            if time_remaining > 0:
+                update_oled_ask_now(time_remaining)
+
+                if ticks_diff(now, ref_time) > 900:
+                    print("LISTENING... {}s remaining | BPM:{} GSR:{}".format(
+                        time_remaining, bpm, gsr_val))
+                    send_ble("TYPE:QUESTION_LIVE|Q:{}|TIME:{}|BPM:{}|GSR:{}|AMP:{}|HRV:{}|SCORE:{}|STATE:{}|SPO2:{}|SIG:{}|IR:{}|RED:{}".format(
+                        question_number, time_remaining, bpm, gsr_val, pulse_amp, hrv,
+                        score, state, spo2_est, signal_pct, ir_val, red_val
+                    ))
+            else:
+                print("Listen window closed. Analysing...")
+                update_oled_text("Analysing...", "Please wait", "", "")
+                send_ble("TYPE:INFO|Q:{}|MSG:Analysing".format(question_number))
+                analyse_response()
+
+    time.sleep(0.01)
+
